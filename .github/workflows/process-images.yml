@@ -1,0 +1,151 @@
+name: Process Article Images
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'posts/**/*.md'
+      - 'posts/**/images/**'
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyyaml requests
+
+      - name: Detect changed markdown files
+        id: changed-files
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...${{ github.event.pull_request.head.sha }} -- 'posts/**/*.md' | tr '\n' ' ')
+          echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "Changed markdown files: $CHANGED_FILES"
+
+      - name: Validate images (dry-run)
+        if: steps.changed-files.outputs.files != ''
+        env:
+          DRY_RUN: "true"
+        run: |
+          python .github/scripts/process_images.py ${{ steps.changed-files.outputs.files }}
+
+  process:
+    if: github.event_name == 'pull_request_target' && github.event.label.name == 'approved'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout base repo (secure)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch PR content
+        run: |
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-branch
+          git checkout pr-branch
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyyaml requests
+
+      - name: Detect changed markdown files
+        id: changed-files
+        run: |
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- 'posts/**/*.md' | tr '\n' ' ')
+          echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "Changed markdown files: $CHANGED_FILES"
+
+      - name: Process and upload images
+        if: steps.changed-files.outputs.files != ''
+        env:
+          CDN_UPLOAD_TOKEN: ${{ secrets.CDN_UPLOAD_TOKEN }}
+          CDN_BASE_URL: "https://cdn.deephacking.tech"
+          DRY_RUN: "false"
+        run: |
+          python .github/scripts/process_images.py ${{ steps.changed-files.outputs.files }}
+
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit processed changes to main
+        if: steps.check-changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Save processed markdown files to temp
+          mkdir -p /tmp/processed
+          find posts -name "*.md" -exec cp --parents {} /tmp/processed/ \;
+          
+          # Discard local changes and switch to main
+          git checkout -- .
+          git checkout main
+          git pull origin main
+          
+          # Copy processed files back
+          cp -r /tmp/processed/posts/* posts/
+          
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Only add the markdown files (not images folder)
+          git add posts/**/*.md
+          git commit -m "Add post: ${{ github.event.pull_request.title }}
+
+          - Images uploaded to CDN
+          - PR #${{ github.event.pull_request.number }} by @${{ github.event.pull_request.user.login }}"
+          
+          git push origin main
+          
+          # Close the PR since we applied changes directly
+          gh pr close ${{ github.event.pull_request.number }} --comment "✅ **Artículo procesado correctamente**
+          
+          Gracias @${{ github.event.pull_request.user.login }} por tu contribución 🎉
+          
+          - ✅ Imágenes optimizadas y subidas al CDN
+          - ✅ Markdown actualizado con URLs del CDN
+          - ✅ Artículo añadido a la rama main
+          
+          El PR se cierra automáticamente porque los cambios se aplicaron directamente."
